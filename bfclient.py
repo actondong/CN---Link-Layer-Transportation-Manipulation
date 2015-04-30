@@ -1,4 +1,5 @@
 #!/usr/bin/python
+# -*- coding: utf-8 -*-
 __author__ = 'Acton'
 import socket
 import sys
@@ -48,7 +49,7 @@ DV_NXT_HOP = {
 }
 
 def pack(ID, hashtable):  # wrap ROUTE UPDATE message into string
-    ID_str = ID[0]+":"+ID[1]# （HOST,PORT） --> HOST:PORT
+    ID_str = ID[0] + ":" + ID[1] #HOST,PORT） --> HOST:PORT
     s = "#" + ID_str + "="
     for key in hashtable:
         key_str = key[0] + ":"+key[1]
@@ -63,9 +64,9 @@ def unpack(data):  # unpack the ROUTE UPDATE message
     ID = tuple(ID_str.split(":"))
     hashtable = {}
     key_value_list = first_lvl_data_list[1].split(">")
-    print key_value_list
+    #print key_value_list
     for key_value in key_value_list:
-        print key_value
+        #print key_value
         if key_value == "":
             continue
         key_value_l = key_value.split("-")
@@ -123,21 +124,44 @@ class DV_Main (threading.Thread):
             print "Process ROUTEMSG...in DV_main()"
             #print self.recv_dv_info
             ID, hashtable = unpack(self.recv_dv_info)
-            print hashtable.keys()
+            #print hashtable.keys()
             #Up date DV by bf algo.
-            del hashtable[(HOST,PORT)]#this is the link info of a neighbor and 'myself' which is useless because of duplicate
-            for dest in hashtable:
+            if DV_INFO[ID] == "Infinity":
+                print "\nA unreachable node now restores"
                 DV_INFO_LOCK.acquire()
-                if dest not in DV_INFO:#this indicates new non-neighbor node(from perspective of myself) in the topology
-                    flag = 1
-                    DV_INFO[dest] = DV_INFO[ID] + hashtable[dest]
-                    DV_NXT_HOP[dest] = ID
-                else:
-                    if DV_INFO[dest] > DV_INFO[ID] + hashtable[dest]:
+                DV_INFO[ID] = hashtable[(HOST,PORT)]
+                DV_NXT_HOP[ID] = ID
+                NEIGHBORS_INFO[ID] = hashtable[(HOST,PORT)]
+                DV_INFO_LOCK.release()
+
+            del hashtable[(HOST,PORT)]#this is the link info of a neighbor and 'myself' which is useless because of duplicate
+
+            DV_INFO_LOCK.acquire()
+            NEIGHBORS_TIMER_INFO[ID] = time.time()
+            for dest in hashtable:
+                if dest not in DV_INFO:
+                    if hashtable[dest] != "Infinity":#this indicates new non-neighbor node(from perspective of myself) in the topology
                         flag = 1
                         DV_INFO[dest] = DV_INFO[ID] + hashtable[dest]
                         DV_NXT_HOP[dest] = ID
-                DV_INFO_LOCK.release()
+
+                else:
+                    if hashtable[dest] != "Infinity":
+                        if DV_INFO[dest] == "Infinity":
+                            flag = 1
+                            DV_INFO[dest] = DV_INFO[ID] + hashtable[dest]
+                            DV_NXT_HOP[dest] = ID
+
+                        if DV_INFO[dest] != "Infinity" and DV_INFO[dest] > DV_INFO[ID] + hashtable[dest]:
+                            flag = 1
+                            DV_INFO[dest] = DV_INFO[ID] + hashtable[dest]
+                            DV_NXT_HOP[dest] = ID
+                    if hashtable[dest] == "Infinity":
+                        if dest in DV_NXT_HOP and DV_NXT_HOP[dest] == ID:
+                            DV_INFO[dest] = "Infinity"
+                            DV_NXT_HOP[dest] = None
+
+            DV_INFO_LOCK.release()
         if flag:
             print "UPDATE DV_INFO...in DV_main"
             dv_data_to_send = pack((HOST,PORT),DV_INFO)
@@ -157,15 +181,18 @@ class Sender (threading.Thread):
         global DV_INFO
         global DV_INFO_LOCK
         global OUTPOOL_LOCK
+        socket_send_to_neighbor = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sendbuff = BUFF
+        socket_send_to_neighbor.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, sendbuff)
         while 1:
             OUTPOOL_LOCK.acquire()
             if len(OUTPOOL) > 0:
                 info_to_send = OUTPOOL.pop(0)
-                socket_send_to_neighbor = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                sendbuff = BUFF
-                socket_send_to_neighbor.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, sendbuff)
+
                 if info_to_send[0] == '#':#This is ROUTEUPDATE message
                     for dest in NEIGHBORS_INFO.keys():
+                        if NEIGHBORS_INFO[dest] == "Infinity":
+                            continue
                         neighbor_host = dest[0]
                         neighbor_port = int(dest[1])
                         info_to_send_poison_reverse = poison_reverse(dest,info_to_send)#apply poison reverse on dv sending to a specific neighbor
@@ -182,8 +209,38 @@ class Timer(threading.Thread):
     def __init__(self):
         threading.Thread.__init__(self)
     def run(self):
+        global HOST
+        global PORT
+        global NEIGHBORS_TIMER_INFO
+        global DV_INFO
+        global DV_NXT_HOP
+        global NEIGHBORS_INFO
+        global OUTPOOL
+        global OUTPOOL_LOCK
+        while 1:
+            time.sleep(TIMEOUT)
+            heartbeat_dv_update = pack((HOST,PORT),DV_INFO)#In my current design, it is possible to send dv_info many times within TIMEOUT. Here I only ensure at least one update will happen if current host is still alive
+            OUTPOOL_LOCK.acquire()
+            OUTPOOL.append(heartbeat_dv_update)
+            OUTPOOL_LOCK.release()
 
-
+            check_point = time.time()
+            DV_INFO_LOCK.acquire()
+            for neighbor,time_last_update in NEIGHBORS_TIMER_INFO.items():
+                if NEIGHBORS_INFO[neighbor] == "Infinity":#This is already a unreachable neighbor
+                    continue
+                if check_point - time_last_update >= 3*TIMEOUT:
+                    print "\nA 3*TIMEOUT exception happen" + str(neighbor) + "set to Infinity"
+                    DV_INFO[neighbor] = "Infinity"
+                    NEIGHBORS_INFO[neighbor] = "Infinity"
+                    for dest,first_hop in DV_NXT_HOP.items():
+                        if first_hop == neighbor:
+                            DV_NXT_HOP[dest] = None
+                    dv_info_to_send = pack((HOST,PORT),DV_INFO)
+                    OUTPOOL_LOCK.acquire()
+                    OUTPOOL.append(dv_info_to_send)
+                    OUTPOOL_LOCK.release()
+            DV_INFO_LOCK.release()
 
 
 
@@ -199,7 +256,7 @@ def main(argv):
     global TIMEOUT
     global TIMEFORMAT
     global NEIGHBORS_TIMER_INFO
-    global NEIGHBORS_TIMER_INFO_LOCK
+    global NEIGHBORS_TIMER_INFO_LOCK#this may be not needed
 
 #main thread takes input from both system.input and listening socket through select. However, sending business is under
 #the charge of Sender thread.
@@ -214,7 +271,7 @@ def main(argv):
     #init listening UDP socket
     HOST = socket.gethostbyname(socket.gethostname())
     PORT = self_host_info[0]
-    TIMEOUT = self_host_info[1]
+    TIMEOUT = float(self_host_info[1])
     listening_socket =  socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     recvbuff = BUFF
     listening_socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, recvbuff)
@@ -222,6 +279,7 @@ def main(argv):
     print "LISTENING ON" + HOST+":"+PORT
     #init neighbor_host_info
     neighbor_info = conf_file_descriptor.readline().strip()
+    DV_INFO_LOCK.acquire()
     while neighbor_info:
         neighbor_info = neighbor_info.split(" ")
         neighbor_ID_info = neighbor_info[0]
@@ -230,7 +288,9 @@ def main(argv):
         NEIGHBORS_INFO[neighbor_ID_tuple] = float(neighbor_weight_info)
         DV_INFO[neighbor_ID_tuple] = float(neighbor_weight_info)
         DV_NXT_HOP[neighbor_ID_tuple] = neighbor_ID_tuple
+        NEIGHBORS_TIMER_INFO[neighbor_ID_tuple] = time.time()
         neighbor_info = conf_file_descriptor.readline().strip()
+    DV_INFO_LOCK.release()
     dv_to_send = pack((HOST,PORT),DV_INFO)#Pack DV_INFO, ready to be sent to neighbors
     OUTPOOL_LOCK.acquire()
     OUTPOOL.append(dv_to_send)
@@ -244,6 +304,9 @@ def main(argv):
     sender_thread = Sender()
     sender_thread.setDaemon(True)
     sender_thread.start()
+    timer_thread = Timer()
+    timer_thread.setDaemon(True)
+    timer_thread.start()
     while 1:
         readable_list, writable_list, exceptionable_list = select.select(READ_LIST, WRITE_LIST,EXCEPTION_LIST)
         for fd in readable_list:
