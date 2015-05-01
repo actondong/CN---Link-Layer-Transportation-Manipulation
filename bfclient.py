@@ -9,6 +9,7 @@ import threading
 import select
 import Queue
 import collections
+import copy
 #Name declaration: clnt0 stands for the host which is running current program. clnt1 - clntN will stand for all its neighbors(adjacent hosts).
 #
 BUFF = 4096
@@ -20,12 +21,23 @@ PORT = None
 OUTPOOL_LOCK = threading.Lock()
 OUTPOOL = []
 #TODO The general architecture
+NEIGHBORS_ORIGIN = {
+    #Once initialized, this table will never change.
+}
 
 NEIGHBORS_INFO = {
-  #For each entry in NEIGHBORS_INFO, key is (IP,Port) tuple and value is the link weight.
+  #This is a dynamic version of NEIGNBORS_ORIGIN. For each entry in NEIGHBORS_INFO, key is (IP,Port) tuple and value is the link weight.
   #This table is initialized based on config file given to start
   #the program and will be updated when neighbors disconnect or new neighbors connect
 }
+
+NEIGHBORS_PREVIOUS = {
+    #This hashtable is used for functionality --LINKDOWN and LINKUP
+    #This may or may not be necessary but till now this is the implementation I came up with
+
+    #This works as a copy of NEIGHBORS_INFO, except when NEIGHBOS_INFO is changed to Infinity, this will keep the link cost before the change.
+}
+
 
 NEIGHBORS_TIMER_INFO_LOCK = threading.Lock()
 NEIGHBORS_TIMER_INFO = {
@@ -45,11 +57,10 @@ DV_INFO = {
 DV_NXT_HOP = {
  # key is (ip,port), value is (ip,port)
  #This is a optimization. Always record next hop to reach each clnt thru shortest parth
-
 }
 
 def pack(ID, hashtable):  # wrap ROUTE UPDATE message into string
-    ID_str = ID[0] + ":" + ID[1] #HOST,PORT） --> HOST:PORT
+    ID_str = ID[0] + ":" + ID[1] #(HOST,PORT） --> HOST:PORT
     s = "#" + ID_str + "="
     for key in hashtable:
         key_str = key[0] + ":"+key[1]
@@ -90,9 +101,9 @@ def poison_reverse(neighbor,dv_to_send):
     for dest in DV_NXT_HOP.keys():
         if dest != neighbor and DV_NXT_HOP[dest] == neighbor:
             hashtable[dest] = 'Infinity'
-            poison_dv_to_send = pack(ID,hashtable)
-            return poison_dv_to_send
-    return dv_to_send
+    poison_dv_to_send = pack(ID,hashtable)
+    return poison_dv_to_send
+    #return dv_to_send
 
 def show_chart():
     global DV_INFO
@@ -107,36 +118,138 @@ def show_chart():
 #TODO I will use a separate thread to update DV, every time DV needs to be updated under two cases as instructed
 #This will finally put a ["#",DV_INFO_COPY] into OUTPOOL which will sit there and wait for sending by sender thread
 class DV_Main (threading.Thread):
-    global HOST
-    global PORT
-    global BUFF
-    global DV_INFO
-    global DV_INFO_LOCK
-    pass
+
     def __init__(self,recv_dv_info):
         threading.Thread.__init__(self)
         self.recv_dv_info = recv_dv_info
     def run(self):
+        global HOST
+        global PORT
+        global BUFF
+        global DV_INFO
+        global NEIGHBORS_INFO
+        global NEIGHBORS_ORIGIN
+        global NEIGHBORS_PREVIOUS
+        global DV_INFO_LOCK
+        global DV_NXT_HOP
         if self.recv_dv_info[0] == '$':
-            pass
-        flag = 0#indicates whether dv has been changed or not
+            recv_dv_info_list = self.recv_dv_info[1:].split(" ")
+            command = recv_dv_info_list[0]
+            if command == "CHANGECOST":
+                print "I am processing CHANGECOST"
+                ID = tuple(recv_dv_info_list[1].split(":"))
+                link_cost = float(recv_dv_info_list[2])
+                DV_INFO_LOCK.acquire()
+                old_cost = DV_INFO[ID]
+                cost_diff = link_cost - old_cost
+                if link_cost < DV_INFO[ID]:
+                    DV_NXT_HOP[ID] = ID
+                    DV_INFO[ID] = link_cost
+                else:
+                    if DV_NXT_HOP[ID] == ID :
+                        DV_INFO[ID] = link_cost
+                    else:
+                        pass
+                NEIGHBORS_INFO[ID] = link_cost
+                NEIGHBORS_PREVIOUS[ID] = link_cost
+                for dest,first_hop in DV_NXT_HOP.items():
+                    if dest != ID and first_hop == ID:
+                        DV_INFO[dest] += cost_diff
+                print ">>>>>>>>>>>>link cost change<<<<<<<<<<"
+                print ID, DV_INFO[ID]
+                print ">>>>>>>>>>>>><<<<<<<<<<<<<<<<<<<<<<<<<"
+                dv_data_to_send = pack((HOST,PORT),DV_INFO)
+                DV_INFO_LOCK.release()
+                OUTPOOL_LOCK.acquire()
+                OUTPOOL.append(dv_data_to_send)
+                OUTPOOL_LOCK.release()
+                return
+            if command == "LINKDOWN":
+                flag = 0
+                print "I am processing LINKDOWN"
+                ID = tuple(recv_dv_info_list[1].split(":"))
+                DV_INFO_LOCK.acquire()
+                NEIGHBORS_INFO[ID] = "Infinity"
+                for dest,first_hop in DV_NXT_HOP.items():
+                    if first_hop == ID:
+                        DV_INFO[dest] = "Infinity"
+                        DV_NXT_HOP[dest] = None
+                        print ">>>>>>>>>>>>Due to "+ str(ID)  +" link down<<<<<<<<<<"
+                        print dest, DV_INFO[dest]
+                        print ">>>>>>>>>>>>>>>>>>>>>>><<<<<<<<<<<<<<<<<<<<<<<<<<<<<<"
+                        flag = 1
+                if flag:
+                    dv_data_to_send = pack((HOST,PORT),DV_INFO)
+                    OUTPOOL_LOCK.acquire()
+                    OUTPOOL.append(dv_data_to_send)
+                    OUTPOOL_LOCK.release()
+                DV_INFO_LOCK.release()
+                return
+            if command == "LINKUP":
+                flag = 0
+                print "I am processing LINKUP"
+                ID = tuple(recv_dv_info_list[1].split(":"))
+                DV_INFO_LOCK.acquire()
+                #This is the only place NEIGHBORS_PREVIOUS is useful
+                NEIGHBORS_INFO[ID] = NEIGHBORS_PREVIOUS[ID]
+                print ">>>>>>>>>>>>"+ str(ID) +" link up<<<<<<<<<<"
+                print " "
+                print ">>>>>>>>>>>>>>>>>>><<<<<<<<<<<<<<<<<<<<<<<<"
+                if DV_INFO[ID] == "Infinity":
+                    flag = 1
+                    DV_INFO[ID] = NEIGHBORS_INFO[ID]
+                    DV_NXT_HOP[ID] = ID
+                else:
+                    if DV_INFO[ID] > NEIGHBORS_INFO[ID]:
+                        flag =1
+                        DV_INFO[ID] = NEIGHBORS_INFO[ID]
+                        DV_NXT_HOP[ID] = ID
+                if flag:
+                    dv_data_to_send = pack((HOST,PORT),DV_INFO)
+                    OUTPOOL_LOCK.acquire()
+                    OUTPOOL.append(dv_data_to_send)
+                    OUTPOOL_LOCK.release()
+                DV_INFO_LOCK.release()
+                return
+
         if self.recv_dv_info[0] == '#':
+            flag = 0#indicates whether dv has been changed or not
             print "Process ROUTEMSG...in DV_main()"
             #print self.recv_dv_info
             ID, hashtable = unpack(self.recv_dv_info)
             #print hashtable.keys()
             #Up date DV by bf algo.
+            DV_INFO_LOCK.acquire()
             if DV_INFO[ID] == "Infinity":
-                print "\nA unreachable node now restores"
-                DV_INFO_LOCK.acquire()
-                DV_INFO[ID] = hashtable[(HOST,PORT)]
-                DV_NXT_HOP[ID] = ID
-                NEIGHBORS_INFO[ID] = hashtable[(HOST,PORT)]
-                DV_INFO_LOCK.release()
+                #Here is very critical, literally we can't ctrl+c to turn off a router and then restart it. Because it will then
+                #looses NEIGHBORS_INFO forever and can't join back properly. We can't only LINKDOWN a router, however it keeps
+                #its NEIGHBORS_INFO safely, when LINKUP, every thing restores.
 
+                #It turns out that we need to consider the situation when we cltr+c (CLOSE) and then join back.
+                #It add cases to deal with when A unreachable node restores.
+                print "\nA unreachable neighbor node now restores"
+                #NEIGHBORS_INFO[ID] = NEIGHBORS_ORIGIN[ID] when a router join back, it restores to previous state but not origin.
+                if NEIGHBORS_INFO[ID] != "Infinity":#this case is not obvious, but is an intermediate case caused by linkdown
+                    DV_INFO[ID] = NEIGHBORS_INFO[ID]
+                    DV_NXT_HOP[ID] = ID
+
+                else:#this case should be restart after cltr+c
+                    NEIGHBORS_INFO[ID] = NEIGHBORS_PREVIOUS[ID]#restore to previous state
+                    DV_INFO[ID] = NEIGHBORS_INFO[ID]
+                    DV_NXT_HOP[ID] = ID
+
+            else:
+                if DV_INFO[ID] != hashtable[(HOST,PORT)]:
+                    print "_____________ADJUST to ORIGIN______________"+ str(ID)
+                    DV_INFO[ID] = NEIGHBORS_INFO[ID]
+                    DV_NXT_HOP[ID] = ID
+                if DV_INFO[ID] == hashtable[(HOST,PORT)]:
+                    if DV_INFO[ID] > NEIGHBORS_INFO[ID]:
+                        print "_____________ANTI-ADJUST to ORIGIN______________"+ str(ID)
+                        DV_INFO[ID] = NEIGHBORS_ORIGIN[ID]
+                        DV_NXT_HOP[ID] = ID
             del hashtable[(HOST,PORT)]#this is the link info of a neighbor and 'myself' which is useless because of duplicate
 
-            DV_INFO_LOCK.acquire()
             NEIGHBORS_TIMER_INFO[ID] = time.time()
             for dest in hashtable:
                 if dest not in DV_INFO:
@@ -144,7 +257,6 @@ class DV_Main (threading.Thread):
                         flag = 1
                         DV_INFO[dest] = DV_INFO[ID] + hashtable[dest]
                         DV_NXT_HOP[dest] = ID
-
                 else:
                     if hashtable[dest] != "Infinity":
                         if DV_INFO[dest] == "Infinity":
@@ -152,12 +264,19 @@ class DV_Main (threading.Thread):
                             DV_INFO[dest] = DV_INFO[ID] + hashtable[dest]
                             DV_NXT_HOP[dest] = ID
 
-                        if DV_INFO[dest] != "Infinity" and DV_INFO[dest] > DV_INFO[ID] + hashtable[dest]:
-                            flag = 1
-                            DV_INFO[dest] = DV_INFO[ID] + hashtable[dest]
-                            DV_NXT_HOP[dest] = ID
+                        else:
+                            if DV_INFO[dest] > DV_INFO[ID] + hashtable[dest]:
+                                flag = 1
+                                print "$$$$$$$$$$$$YOU SHOULD SEE THIS$$$$$$$$$$$$$$$$$$$$"
+                                DV_INFO[dest] = DV_INFO[ID] + hashtable[dest]
+                                DV_NXT_HOP[dest] = ID
+                            elif DV_NXT_HOP[dest] == ID and DV_INFO[dest] < DV_INFO[ID] + hashtable[dest] :
+                                flag = 1
+                                print "++++++++++++YOU SHOULD SEE THIS++++++++++++++++++++++"
+                                DV_INFO[dest] = DV_INFO[ID] + hashtable[dest]
                     if hashtable[dest] == "Infinity":
                         if dest in DV_NXT_HOP and DV_NXT_HOP[dest] == ID:
+                            flag = 1
                             DV_INFO[dest] = "Infinity"
                             DV_NXT_HOP[dest] = None
 
@@ -200,8 +319,25 @@ class Sender (threading.Thread):
                         socket_send_to_neighbor.sendto(info_to_send_poison_reverse,(neighbor_host,neighbor_port))
                         print "dv_to_send is sending in Sender()...to "+ neighbor_host + ":"+ str(neighbor_port)
                 if info_to_send[0] == '$':
-                    pass
-
+                    #now only support changecost command
+                    info_to_send_list = info_to_send[1:].split(" ")
+                    if info_to_send_list[0] == "CHANGECOST":
+                        command_label = info_to_send_list[0]
+                        dest = tuple(info_to_send_list[1].split(":"))
+                        neighbor_host = dest[0]
+                        neighbor_port = int(dest[1])
+                        link_cost = info_to_send_list[2]
+                        command_info_to_send="$"+command_label+" "+HOST+":"+PORT+" "+link_cost#Notice this is to be sent to the neighbor which would be effected by this change of link cost, so ID part should refer to clnt0
+                        socket_send_to_neighbor.sendto(command_info_to_send,(neighbor_host,neighbor_port))
+                        print "command_to_CHANGECOST_send is sending in Sender()...to "+ neighbor_host + ":"+ str(neighbor_port)
+                    if info_to_send_list[0] == "LINKDOWN" or info_to_send_list[0] == "LINKUP":
+                        command_label = info_to_send_list[0]
+                        dest = tuple(info_to_send_list[1].split(":"))
+                        neighbor_host = dest[0]
+                        neighbor_port = int(dest[1])
+                        command_info_to_send="$"+command_label+" "+HOST+":"+PORT+" "#Notice this is to be sent to the neighbor which would be effected by this change of link cost, so ID part should refer to clnt0
+                        socket_send_to_neighbor.sendto(command_info_to_send,(neighbor_host,neighbor_port))
+                        print "command_to_LINKUP/DOWN_send is sending in Sender()...to "+ neighbor_host + ":"+ str(neighbor_port)
             OUTPOOL_LOCK.release()
 
 
@@ -215,11 +351,13 @@ class Timer(threading.Thread):
         global DV_INFO
         global DV_NXT_HOP
         global NEIGHBORS_INFO
+        global NEIGHBORS_PREVIOUS
         global OUTPOOL
         global OUTPOOL_LOCK
         while 1:
             time.sleep(TIMEOUT)
             heartbeat_dv_update = pack((HOST,PORT),DV_INFO)#In my current design, it is possible to send dv_info many times within TIMEOUT. Here I only ensure at least one update will happen if current host is still alive
+            print "Timer dv update"+heartbeat_dv_update
             OUTPOOL_LOCK.acquire()
             OUTPOOL.append(heartbeat_dv_update)
             OUTPOOL_LOCK.release()
@@ -231,17 +369,19 @@ class Timer(threading.Thread):
                     continue
                 if check_point - time_last_update >= 3*TIMEOUT:
                     print "\nA 3*TIMEOUT exception happen" + str(neighbor) + "set to Infinity"
-                    DV_INFO[neighbor] = "Infinity"
+                    DV_INFO[neighbor] = "Infinity" #this must be the case. The only trigger for TIMEOUT*3 is CLOSE which means that node doesn't exist anymore.
+                    DV_NXT_HOP[neighbor] = None
                     NEIGHBORS_INFO[neighbor] = "Infinity"
+                    NEIGHBORS_TIMER_INFO[neighbor] = float(0)
                     for dest,first_hop in DV_NXT_HOP.items():
                         if first_hop == neighbor:
+                            DV_INFO[dest] = "Infinity"
                             DV_NXT_HOP[dest] = None
-                    dv_info_to_send = pack((HOST,PORT),DV_INFO)
+                    dv_info_to_send = pack((HOST,PORT),DV_INFO)#update dv_info
                     OUTPOOL_LOCK.acquire()
                     OUTPOOL.append(dv_info_to_send)
                     OUTPOOL_LOCK.release()
             DV_INFO_LOCK.release()
-
 
 
 #TODO I will of course also have a main thread
@@ -257,7 +397,8 @@ def main(argv):
     global TIMEFORMAT
     global NEIGHBORS_TIMER_INFO
     global NEIGHBORS_TIMER_INFO_LOCK#this may be not needed
-
+    global NEIGHBORS_ORIGIN
+    global NEIGHBORS_PREVIOUS
 #main thread takes input from both system.input and listening socket through select. However, sending business is under
 #the charge of Sender thread.
     if len(argv) != 2:
@@ -286,6 +427,10 @@ def main(argv):
         neighbor_ID_tuple = tuple(neighbor_ID_info.split(":"))
         neighbor_weight_info = neighbor_info[1]
         NEIGHBORS_INFO[neighbor_ID_tuple] = float(neighbor_weight_info)
+        #It may be tedious to keep three NEIGHBROS tables, though some of these three table will be almost same most time,
+        #they differentiate when certain commands or situations occur.
+        NEIGHBORS_PREVIOUS[neighbor_ID_tuple] = float(neighbor_weight_info)
+        NEIGHBORS_ORIGIN[neighbor_ID_tuple] = float(neighbor_weight_info)
         DV_INFO[neighbor_ID_tuple] = float(neighbor_weight_info)
         DV_NXT_HOP[neighbor_ID_tuple] = neighbor_ID_tuple
         NEIGHBORS_TIMER_INFO[neighbor_ID_tuple] = time.time()
@@ -312,24 +457,36 @@ def main(argv):
         for fd in readable_list:
             if fd == sys.stdin:
                 command = (raw_input("[Issue your command(to see what commands are supported, type help)]:")).strip()
+                #For now I assume right input format
                 command_list = command.split(" ")
                 command_label = command_list[0]
-                if command_label == "LINKDOWN" or "LINKUP" or "CHANGECOST":
-                    command_info = "$"+" "+command
+                if command_label == "CHANGECOST":
+                    ID = command_list[1]+":"+command_list[2]
+                    link_cost = command_list[3]
+                    command_info = "$"+command_label+" "+ID+" "+link_cost#protocal: $CHANGECOST IP:HOST COST
                     OUTPOOL_LOCK.acquire()
                     OUTPOOL.append(command_info)#this command info requires updating on both sides of the link modified
                     OUTPOOL_LOCK.release()
-
                     dv_thread = DV_Main(command_info)
                     dv_thread.setDaemon(True)
                     dv_thread.run()
+                if command_label == "LINKDOWN" or command_label == "LINKUP":
+                    ID = command_list[1]+":"+command_list[2]
+                    command_info = "$"+command_label+" "+ID + " "
+                    OUTPOOL_LOCK.acquire()
+                    OUTPOOL.append(command_info)#this command info requires updating on both sides of the link modified
+                    OUTPOOL_LOCK.release()
+                    dv_thread = DV_Main(command_info)
+                    dv_thread.setDaemon(True)
+                    dv_thread.run()
+
                 if command_label == "CLOSE":
                      pass
                 if command_label == "SHOWRT":
                      show_chart()
 
             else:
-                print "Info is coming thru UDP socket.."
+                #print "Info is coming thru UDP socket.."
                 recv_data,addr = fd.recvfrom(BUFF)
                 if recv_data[0] == '#':#this is ROUTE_UPDATE msg
                     print "I got ROUTEMSG from neighbors!"
@@ -337,7 +494,10 @@ def main(argv):
                     dv_thread.setDaemon(True)
                     dv_thread.run()
                 elif recv_data[0] == '$':#this is commands msg which include LINKDOWN,LINKUP,CLOSE
-                    pass
+		    print "I got COMMAND MSG from neighbors!"
+		    dv_thread = DV_Main(recv_data)
+                    dv_thread.setDaemon(True)
+                    dv_thread.run()
                 else:
                     pass
 
