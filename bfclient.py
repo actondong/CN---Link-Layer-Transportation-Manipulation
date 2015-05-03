@@ -12,7 +12,8 @@ import collections
 import copy
 #Name declaration: clnt0 stands for the host which is running current program. clnt1 - clntN will stand for all its neighbors(adjacent hosts).
 #
-BUFF = 4096
+CHUNKSIZE = 20480
+BUFF = 40960
 TIMEFORMAT = '%Y-%m-%d %X'
 TIMEOUT = None
 TIMER = None
@@ -96,14 +97,17 @@ def poison_reverse(neighbor,dv_to_send):
     global BUFF
     global DV_INFO
     global DV_NXT_HOP
-
+    global DV_INFO_LOCK
+    DV_INFO_LOCK.acquire()
     ID , hashtable = unpack(dv_to_send)
     for dest in DV_NXT_HOP.keys():
         if dest != neighbor and DV_NXT_HOP[dest] == neighbor:
             hashtable[dest] = 'Infinity'
     poison_dv_to_send = pack(ID,hashtable)
+    DV_INFO_LOCK.release()
     return poison_dv_to_send
-    #return dv_to_send
+
+
 
 def show_chart():
     global DV_INFO
@@ -115,10 +119,10 @@ def show_chart():
         print "\nDESTINATION = "+str(dest)+" Cost = "+ str(DV_INFO[dest]) + " Link = "+str(hop)
     DV_INFO_LOCK.release()
 
-#I only need to do one thing when I am closing, inform my neighbors that I am done. Let them change their NEIGHBORS_PREVIOUS
-#  link cost to NEIGHBROS_ORIGIN link cost. So they won't be confused when I restore.(after restoring, two sides will share same
-# info about previous link cost)...This may be not a practical design, it doesn't reflect the nature of 'die' abruptly. But,
-# to consider many possible cases, (you linkdown a changecost link, you 'die' when you link cost already changes and then you restore before timeout)
+#This is the function to call when CLOSE.
+#What it does is to inform neighbors that I am closing. This design is for sake of synchronization.
+#If I don't organize informing neighbors at the same time, using ctrl+c and wait for 3*TIMEOUT may cause weird behavior
+#among neighbors sometime, which is not predictable.
 def last_words():
     global NEIGHBORS_INFO
     global OUTPOOL_LOCK
@@ -134,6 +138,59 @@ def last_words():
     OUTPOOL_LOCK.release()
     time.sleep(2)
 
+
+def read_in_chunks(file_name, chunk_size=CHUNKSIZE):
+    while True:
+        data = file_name.read(chunk_size)
+        if not data:
+            break
+        yield data
+
+#This function inludes framentation a big file, package it with header, put separated chunks into OUTPOOL.
+def transfer_big_file(file_name,dest):
+    global DV_NXT_HOP
+    global DV_INFO_LOCK
+    global OUTPOOL
+    global OUTPOOL_LOCK
+    f = open(file_name,'r')
+    DV_INFO_LOCK.acquire()
+    OUTPOOL_LOCK.acquire()
+    seq = 0
+    for chunck in read_in_chunks(f):
+        next_hop = DV_NXT_HOP[dest]
+        header = "@"+file_name+" "+dest[0]+":"+dest[1]+" "+next_hop[0]+":"+next_hop[1]+" "+HOST+":"+PORT +" "+ str(seq)+" "
+        package_to_send = header + chunck
+        OUTPOOL.append(package_to_send)
+        seq += 1
+    OUTPOOL_LOCK.release()
+    DV_INFO_LOCK.release()
+
+#This function pass on file chunks to destination
+def relay_race(file_package_data):
+    global DV_NXT_HOP
+    global DV_INFO_LOCK
+    global OUTPOOL
+    global OUTPOOL_LOCK
+    global  HOST
+    global  PORT
+    data_list = file_package_data[1:].split(" ")
+    file_name = data_list[0]
+    dest = tuple(data_list[1].split(":"))
+    source = tuple(data_list[3].split(":"))
+    seq = data_list[4]
+    if dest == (HOST,PORT):
+        print "File: "+file_name +"seq_No.: "+ seq + " from " +str(source)+ " safely received. Transfer done"
+    else:
+        DV_INFO_LOCK.acquire()
+        next_hop = DV_NXT_HOP[dest]
+        data_list[0] = "@"+file_name
+        data_list[2] = next_hop[0]+":"+next_hop[1]
+        print "File: " + file_name + "seq_No.: " + seq + " to "+ str(dest)+" from "+ str(source)+  " thru next hop:"+ data_list[2]+" is passing on"
+        data_package_to_relay = " ".join(data_list)
+        OUTPOOL_LOCK.acquire()
+        OUTPOOL.append(data_package_to_relay)
+        OUTPOOL_LOCK.release()
+        DV_INFO_LOCK.release()
 
 
 #TODO I will use a separate thread to update DV, every time DV needs to be updated under two cases as instructed
@@ -370,9 +427,10 @@ class Sender (threading.Thread):
         global DV_INFO_LOCK
         global NEIGHBORS_INFO
         global OUTPOOL_LOCK
+        global BUFF
         socket_send_to_neighbor = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sendbuff = BUFF
-        socket_send_to_neighbor.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, sendbuff)
+
+        socket_send_to_neighbor.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, BUFF)
         while 1:
             OUTPOOL_LOCK.acquire()
             if len(OUTPOOL) > 0:
@@ -411,6 +469,12 @@ class Sender (threading.Thread):
                             neighbor_host = dest[0]
                             neighbor_port = int(dest[1])
                             socket_send_to_neighbor.sendto(info_to_send,(neighbor_host,neighbor_port))
+                if info_to_send[0] == "@":
+                    info_to_send_list = info_to_send[1:].split(" ")
+                    next_hop = info_to_send_list[2].split(":")
+                    next_hop_ip = next_hop[0]
+                    next_hop_port = int(next_hop[1])
+                    socket_send_to_neighbor.sendto(info_to_send,(next_hop_ip,next_hop_port))
 
             OUTPOOL_LOCK.release()
 
@@ -574,6 +638,10 @@ def main(argv):
 
                 if command_label == "SHOWRT":
                     show_chart()
+                if command_label == "TRANSFER":
+                    file_name = command_list[1]
+                    dest = (command_list[2],command_list[3])
+                    transfer_big_file(file_name,dest)
 
             else:
                 #print "Info is coming thru UDP socket.."
@@ -584,12 +652,14 @@ def main(argv):
                     dv_thread.setDaemon(True)
                     dv_thread.run()
                 elif recv_data[0] == '$':#this is commands msg which include LINKDOWN,LINKUP,CLOSE
-		    print "I got COMMAND MSG from neighbors!"
-		    dv_thread = DV_Main(recv_data)
+                    print "I got COMMAND MSG from neighbors!"
+                    dv_thread = DV_Main(recv_data)
                     dv_thread.setDaemon(True)
                     dv_thread.run()
-                else:
-                    pass
+                elif recv_data[0] == '@':#this is file_transfer package msg
+                    relay_race(recv_data)
+
+
 
 if __name__ == '__main__':
 
