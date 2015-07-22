@@ -10,17 +10,26 @@ import select
 import Queue
 import collections
 import copy
-#Name declaration: clnt0 stands for the host which is running current program. clnt1 - clntN will stand for all its neighbors(adjacent hosts).
-#
+import collections
 CHUNKSIZE = 20480
 BUFF = 40960
-TIMEFORMAT = '%Y-%m-%d %X'
 TIMEOUT = None
-TIMER = None
+TIMEOUT_ACK_GIVEUP = 10#I fix this value, I don't want keep resending for more than 10 seconds.
+TIMEOUT_ACK_RESEND = 2#if not ack, resend every 2 seconds
+ACK_NUM = 0
 HOST = None
 PORT = None
 OUTPOOL_LOCK = threading.Lock()
 OUTPOOL = []
+PROXY = False
+PROXY_IP = None
+PROXY_PORT = None
+READY_TO_WRITE = False#control when to start writing out a received file
+
+BIG_CONTENT_DICT_LOCK = threading.Lock()
+#key = fileName value = [(seq,content)]
+BIG_CONTENT_DICT = collections.defaultdict(list)
+
 #TODO The general architecture
 NEIGHBORS_ORIGIN = {
     #Once initialized, this table will never change.
@@ -60,6 +69,17 @@ DV_NXT_HOP = {
  #This is a optimization. Always record next hop to reach each clnt thru shortest parth
 }
 
+
+DATA_WAITING_FOR_ACK_LOCK = threading.Lock()
+DATA_WAITING_FOR_ACK = {
+ # key is ACK number, value is (data_sent,time_when_sent)
+ # Every msg sent out will be recorded in this dict. When ack is received, record will be deleted
+}
+
+PROXY_NEIGHBORS_LOCK = threading.Lock()
+PROXY_NEIGHBORS = {
+    #neighors for which we must go through proxies to reach.
+}
 def pack(ID, hashtable):  # wrap ROUTE UPDATE message into string
     ID_str = ID[0] + ":" + ID[1] #(HOST,PORT） --> HOST:PORT
     s = "#" + ID_str + "="
@@ -108,7 +128,6 @@ def poison_reverse(neighbor,dv_to_send):
     return poison_dv_to_send
 
 
-
 def show_chart():
     global DV_INFO
     global DV_NXT_HOP
@@ -120,8 +139,8 @@ def show_chart():
     DV_INFO_LOCK.release()
 
 #This is the function to call when CLOSE.
-#What it does is to inform neighbors that I am closing. This design is for sake of synchronization.
-#If I don't organize informing neighbors at the same time, using ctrl+c and wait for 3*TIMEOUT may cause weird behavior
+#What it does is to inform neighbors that I am closing. This design is for sake of stabilization.
+#If I don't organize informing neighbors when closing, instead using ctrl+c and wait for 3*TIMEOUT may cause weird behavior
 #among neighbors sometime, which is not predictable.
 def last_words():
     global NEIGHBORS_INFO
@@ -138,7 +157,7 @@ def last_words():
     OUTPOOL_LOCK.release()
     time.sleep(2)
 
-
+#This is a yield function helper for large data reading and processing
 def read_in_chunks(file_name, chunk_size=CHUNKSIZE):
     while True:
         data = file_name.read(chunk_size)
@@ -147,25 +166,39 @@ def read_in_chunks(file_name, chunk_size=CHUNKSIZE):
         yield data
 
 #This function inludes framentation a big file, package it with header, put separated chunks into OUTPOOL.
+#Caution, I don't put and send, I put all and send all. Which means, don't try to put in 8G files ...
 def transfer_big_file(file_name,dest):
     global DV_NXT_HOP
     global DV_INFO_LOCK
     global OUTPOOL
     global OUTPOOL_LOCK
+    global DATA_WAITING_FOR_ACK
+    global DATA_WAITING_FOR_ACK_LOCKdata_list
     f = open(file_name,'r')
     DV_INFO_LOCK.acquire()
     OUTPOOL_LOCK.acquire()
     seq = 0
+    DATA_WAITING_FOR_ACK_LOCK.acquire()
     for chunck in read_in_chunks(f):
         next_hop = DV_NXT_HOP[dest]
-        header = "@"+file_name+" "+dest[0]+":"+dest[1]+" "+next_hop[0]+":"+next_hop[1]+" "+HOST+":"+PORT +" "+ str(seq)+" "
-        package_to_send = header + chunck
+        header = "@"+file_name+" "+dest[0]+":"+dest[1]+" "+next_hop[0]+":"+next_hop[1]+" "+HOST+":"+PORT +" "+ str(seq)
+        #==========checksum====================
+        content_checksum = sum(bytearray(chunck))
+        print "CHECKSUM = " + str(content_checksum)
+        chunck += " "+str(content_checksum)
+        #======================================
+        package_to_send = header +" "+ chunck
+        #==========ack ========================
+        package_to_send = ack_increment(package_to_send)
+        #======================================
         OUTPOOL.append(package_to_send)
         seq += 1
+
+    DATA_WAITING_FOR_ACK_LOCK.release()
     OUTPOOL_LOCK.release()
     DV_INFO_LOCK.release()
 
-#This function pass on file chunks to destination
+#This function pass on file chunks to destination, if already arrive at destination, report it and done.
 def relay_race(file_package_data):
     global DV_NXT_HOP
     global DV_INFO_LOCK
@@ -173,14 +206,41 @@ def relay_race(file_package_data):
     global OUTPOOL_LOCK
     global  HOST
     global  PORT
+    global BIG_CONTENT_DICT
+    global READY_TO_WRITE
     data_list = file_package_data[1:].split(" ")
     file_name = data_list[0]
     dest = tuple(data_list[1].split(":"))
     source = tuple(data_list[3].split(":"))
     seq = data_list[4]
-    if dest == (HOST,PORT):
-        print "File: "+file_name +"seq_No.: "+ seq + " from " +str(source)+ " safely received. Transfer done"
-    else:
+    if dest == (HOST,PORT):#Reach destination
+        socket_ack = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        ack_num = data_list[-1]#extract ack number
+        checksum_record = data_list[-2]
+        data_l = len(data_list)
+        checksum = str(sum(bytearray(" ".join(data_list[5:data_l-2]))))#extract portion of content
+        print "receive msg CHECKSUM ==== "+ str(checksum)
+        print "receive msg CHECKSUM 's RECORD==== "+ str(checksum_record)
+        if checksum == checksum_record:#only ack when checksum match
+            print "checksum right"
+            print "File: "+file_name +"seq_No.: "+ seq + " from " +str(source)+ " safely received. Transfer done"
+            source_ip = data_list[3].split(":")[0]
+            source_port = int(data_list[3].split(":")[1])
+            ack_msg = "%" + ack_num
+            #send back ack
+            socket_ack.sendto( ack_msg,(source_ip,source_port))
+            socket_ack.close()
+            data_list.pop()
+            data_list.pop()#get rid of  ack number and checksum.
+            recv_content = " ".join(data_list[5:data_l-2])
+            recv_content_seq = seq
+            BIG_CONTENT_DICT_LOCK.acquire()
+            BIG_CONTENT_DICT[file_name].append((recv_content_seq,recv_content))
+            BIG_CONTENT_DICT_LOCK.release()
+            READY_TO_WRITE = True#this is aprroximating mechanism.
+        else:
+            print "checksum wrong"
+    else:#Reach hops 
         DV_INFO_LOCK.acquire()
         next_hop = DV_NXT_HOP[dest]
         data_list[0] = "@"+file_name
@@ -193,10 +253,35 @@ def relay_race(file_package_data):
         DV_INFO_LOCK.release()
 
 
+def ack_increment(info_to_send):#This basic increment function is used for TRANSFER file
+    global ACK_NUM
+    #DATA_WAITING_FROACK_LOCK will be required and released within transfer_big_data
+    print ACK_NUM
+    ack_increment_info = info_to_send+" "+str(ACK_NUM)
+    DATA_WAITING_FOR_ACK[ACK_NUM] = (ack_increment_info,time.time())
+    ACK_NUM += 1
+    return ack_increment_info
+
+def check_proxy(nexthop):
+    global PROXY_PORT
+    global PROXY_IP
+    global PROXY_NEIGHBORS_LOCK
+    global PROXY_NEIGHBORS
+    ip = nexthop[0]
+    port = str(nexthop[1])
+    nexthop = (ip,port)#right format of key now
+    PROXY_NEIGHBORS_LOCK.acquire()
+    if nexthop in PROXY_NEIGHBORS:
+        print str(nexthop) + "MUST GO THRU PROXY.........."
+        PROXY_NEIGHBORS_LOCK.release()
+        return True
+    else:
+        PROXY_NEIGHBORS_LOCK.release()
+        return False
+
 #TODO I will use a separate thread to update DV, every time DV needs to be updated under two cases as instructed
 #This will finally put a ["#",DV_INFO_COPY] into OUTPOOL which will sit there and wait for sending by sender thread
 class DV_Main (threading.Thread):
-
     def __init__(self,recv_dv_info):
         threading.Thread.__init__(self)
         self.recv_dv_info = recv_dv_info
@@ -216,7 +301,7 @@ class DV_Main (threading.Thread):
         if self.recv_dv_info[0] == '$':
             recv_dv_info_list = self.recv_dv_info[1:].split(" ")
             command = recv_dv_info_list[0]
-            if command == "CLOSE":#Notice this doesn't mean I am closing, this means one of my neighbors is closing.
+            if command == "CLOSE":#Notice when you receive this, doesn't mean I am closing, this means one of my neighbors is closing.
                 ID = tuple(recv_dv_info_list[1].split(":"))
                 DV_INFO_LOCK.acquire()
                 print "Bye---------------------------------"+str(ID)
@@ -312,18 +397,11 @@ class DV_Main (threading.Thread):
             DV_INFO_LOCK.acquire()
             #---------------------------------First check conditions of two sides of the link---------------------------
             if DV_INFO[ID] == "Infinity":
-                #Here is very critical, literally we can't ctrl+c to turn off a router and then restart it. Because it will then
-                #looses NEIGHBORS_INFO forever and can't join back properly. We can't only LINKDOWN a router, however it keeps
-                #its NEIGHBORS_INFO safely, when LINKUP, every thing restores.
-
-                #It turns out that we need to consider the situation when we cltr+c (CLOSE) and then join back.
-                #It add cases to deal with when A unreachable node restores.
                 print "\nA Unreachable Neighbor Node Now Restores"
                 if NEIGHBORS_INFO[ID] != "Infinity":
                     print "\nCheers...Arise in time to avoid 3*TIMEOUT"
                     DV_INFO[ID] = NEIGHBORS_INFO[ID]
                     DV_NXT_HOP[ID] = ID
-
                 else:
                     print "BACK TO ORIGIN..You see this because you CLOSE before"
                     NEIGHBORS_INFO[ID] = NEIGHBORS_ORIGIN[ID]
@@ -355,17 +433,12 @@ class DV_Main (threading.Thread):
                             DV_INFO[ID] = NEIGHBORS_INFO[ID]
                             DV_NXT_HOP[ID] = ID
 
-                    #I need to update NEIGHBORS_PREVIOUS[ID] to NEIGHBORS_ORIGIN after CLOSE issued on the other side.
-                    #I am taking this out.
-                    #DV_INFO[ID] = NEIGHBORS_PREVIOUS[ID]
-                    #DV_NXT_HOP[ID] = ID
                 else:
                     if DV_INFO[ID] > NEIGHBORS_INFO[ID]:#this is more like optimization
                         print "_____________ Adjust to Go Directly to Neighbor ______________"+ str(ID)
                         DV_INFO[ID] = NEIGHBORS_INFO[ID]#NEIGHBORS_ORIGIN[ID]
                         DV_NXT_HOP[ID] = ID
             del hashtable[(HOST,PORT)]#this is the link info of a neighbor and 'myself' which is useless now
-
 
             #------------------------------------------Regular Maintain--------------------------------------------------
             for dest in hashtable:
@@ -375,7 +448,7 @@ class DV_Main (threading.Thread):
                         DV_INFO[dest] = DV_INFO[ID] + hashtable[dest]
                         DV_NXT_HOP[dest] = DV_NXT_HOP[ID]
                     else:#this is weird situation, but exits due to my design of CLOSE
-                       print "This May Occur CLOSE and then restart!"
+                       #print "This May Occur CLOSE and then restart!"
                        DV_INFO[dest] = "Infinity"
                        DV_NXT_HOP[dest] = None
                 else:
@@ -428,9 +501,11 @@ class Sender (threading.Thread):
         global NEIGHBORS_INFO
         global OUTPOOL_LOCK
         global BUFF
-        socket_send_to_neighbor = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
+        socket_send_to_neighbor = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         socket_send_to_neighbor.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, BUFF)
+        socket_send_to_proxy = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        socket_send_to_proxy.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, BUFF)
         while 1:
             OUTPOOL_LOCK.acquire()
             if len(OUTPOOL) > 0:
@@ -442,7 +517,6 @@ class Sender (threading.Thread):
                         neighbor_host = dest[0]
                         neighbor_port = int(dest[1])
                         info_to_send_poison_reverse = poison_reverse(dest,info_to_send)#apply poison reverse on dv sending to a specific neighbor
-                        #print info_to_send_poison_reverse
                         socket_send_to_neighbor.sendto(info_to_send_poison_reverse,(neighbor_host,neighbor_port))
                         print "dv_to_send is sending in Sender()...to "+ neighbor_host + ":"+ str(neighbor_port)
                 if info_to_send[0] == '$':
@@ -468,13 +542,18 @@ class Sender (threading.Thread):
                         for dest in NEIGHBORS_INFO.keys():
                             neighbor_host = dest[0]
                             neighbor_port = int(dest[1])
+
+
                             socket_send_to_neighbor.sendto(info_to_send,(neighbor_host,neighbor_port))
-                if info_to_send[0] == "@":
+                if info_to_send[0] == "@":#file transfer
                     info_to_send_list = info_to_send[1:].split(" ")
                     next_hop = info_to_send_list[2].split(":")
                     next_hop_ip = next_hop[0]
                     next_hop_port = int(next_hop[1])
-                    socket_send_to_neighbor.sendto(info_to_send,(next_hop_ip,next_hop_port))
+                    if check_proxy((next_hop_ip,next_hop_port)):
+                        socket_send_to_proxy.sendto(info_to_send,(PROXY_IP,int(PROXY_PORT)))
+                    else:
+                        socket_send_to_neighbor.sendto(info_to_send,(next_hop_ip,next_hop_port))
 
             OUTPOOL_LOCK.release()
 
@@ -523,12 +602,72 @@ class Timer(threading.Thread):
                     OUTPOOL_LOCK.release()
             DV_INFO_LOCK.release()
 
+class Timer_ACK(threading.Thread):
+    def __init__(self):
+        threading.Thread.__init__(self)
+    def run(self):
+        global DATA_WAITING_FOR_ACK_LOCK
+        global DATA_WAITING_FOR_ACK
+        global OUTPOOL
+        global OUTPOOL_LOCK
+        global TIMEOUT_ACK_GIVEUP
+        global TIMEOUT_ACK_RESEND
+        while 1:
+            time.sleep(TIMEOUT_ACK_RESEND)
+            DATA_WAITING_FOR_ACK_LOCK.acquire()
+            OUTPOOL_LOCK.acquire()
+            for msg_ack in DATA_WAITING_FOR_ACK:
+                if DATA_WAITING_FOR_ACK[msg_ack]:
+                    print "ROUTINE CHECKing of non-ACK MSG"
+                    time_current = time.time()
+                    time_sent = DATA_WAITING_FOR_ACK[msg_ack][1]
+                    data_sent = DATA_WAITING_FOR_ACK[msg_ack][0]
+                    if time_current - time_sent > TIMEOUT_ACK_RESEND:
+                        if time_current - time_sent > TIMEOUT_ACK_GIVEUP:
+                            print "!!!TIMEOUT: GIVEUP ON UN-ACK MSG!!!"
+                            DATA_WAITING_FOR_ACK[msg_ack] = None
+                        else:
+                            print "!!!RESEND UN-ACK MSG!!!"
+                            OUTPOOL.append(data_sent)
+            OUTPOOL_LOCK.release()
+            DATA_WAITING_FOR_ACK_LOCK.release()
 
+class Writeout_Big_FIle(threading.Thread):
+    def __init__(self):
+        threading.Thread.__init__(self)
+    def run(self):
+        global READY_TO_WRITE
+        global BIG_CONTENT_DICT_LOCK
+        global BIG_CONTENT_DICT
+        while 1:
+            if READY_TO_WRITE:
+                time.sleep(10)#Approximate comprise mechanism because lack of time, assume file will be fully received within 10 mins
+                BIG_CONTENT_DICT_LOCK.acquire()
+                if len(BIG_CONTENT_DICT.keys()) > 0 :
+                    file_name_list = list(BIG_CONTENT_DICT.keys())
+                    print "^^^^^^^^^^^^^^^^^^^^^^^^"
+                    print"Write Out"
+                    print "^^^^^^^^^^^^^^^^^^^^^^^^"
+                    for file_name in file_name_list:
+                        seq_content_list = BIG_CONTENT_DICT[file_name]
+                        file_name_l = file_name.split(".")
+                        file_name_l[0] = "newcopy"
+                        file_name_new = ".".join(file_name_l)
+                        seq_content_list = sorted(seq_content_list,key=lambda l:l[0])
+                        file_to_write = open(file_name_new,"w")
+                        for seq_content in seq_content_list:
+                            file_to_write.write(seq_content[1])
+                        file_to_write.close()
+                        del BIG_CONTENT_DICT[file_name]
+                BIG_CONTENT_DICT_LOCK.release()
+            READY_TO_WRITE = False
 #TODO I will of course also have a main thread
 #main thread
 def main(argv):
     global HOST
     global PORT
+    global PROXY_IP
+    global PROXY_PORT
     global BUFF
     global DV_INFO
     global DV_INFO_LOCK
@@ -592,6 +731,12 @@ def main(argv):
     timer_thread = Timer()
     timer_thread.setDaemon(True)
     timer_thread.start()
+    ack_timer_thread = Timer_ACK()
+    ack_timer_thread.setDaemon(True)
+    ack_timer_thread.start()
+    write_big_file_thread = Writeout_Big_FIle()
+    write_big_file_thread.setDaemon(True)
+    write_big_file_thread.start()
     while 1:
         readable_list, writable_list, exceptionable_list = select.select(READ_LIST, WRITE_LIST,EXCEPTION_LIST)
         for fd in readable_list:
@@ -626,12 +771,6 @@ def main(argv):
                     dv_thread.run()
 
                 if command_label == "CLOSE":
-                     #--I only need to do one thing when I am closing, inform my neighbors that I am done. Let them change their NEIGHBORS_PREVIOUS
-                     #-- link cost to NEIGHBROS_ORIGIN link cost. So they won't be confused when I restore.(after restoring, two sides will share same
-                     #-- info about previous link cost)...This may be not a practical design, it doesn't reflect the nature of 'die' abruptly. But,
-                     #-- to consider many possible cases, (you linkdown a changecost link, you 'die' when you link cost already changes and then you restore before timeout)
-                     #== The above design suffer weird behaviors on complicate topology tested on. For some nodes, after CLOSE and 3*TIMEOUT, weird behavior happens.
-                     #== I make a second try to stabilize it.
                      #   see details in function last_words()
                     last_words()
                     sys.exit("CLOSE ...")
@@ -642,6 +781,20 @@ def main(argv):
                     file_name = command_list[1]
                     dest = (command_list[2],command_list[3])
                     transfer_big_file(file_name,dest)
+                if command_label == "ADDPROXY":
+                    PROXY_IP = command_list[1]
+                    PROXY_PORT = command_list[2]
+                    neighbor_info = (command_list[3],command_list[4])
+                    PROXY_NEIGHBORS_LOCK.acquire()
+                    PROXY_NEIGHBORS[neighbor_info] = True
+                    PROXY_NEIGHBORS_LOCK.release()
+                    print "aad proxy b/t" + str(neighbor_info)
+                if command_label == "REMOVEPROXY" :
+                    neighbor_info = (command_list[1],command_list[2])
+                    PROXY_NEIGHBORS_LOCK.acquire()
+                    del PROXY_NEIGHBORS[neighbor_info]
+                    PROXY_NEIGHBORS_LOCK.release()
+                    print "remove proxy b/t" + str(neighbor_info)
 
             else:
                 #print "Info is coming thru UDP socket.."
@@ -658,6 +811,12 @@ def main(argv):
                     dv_thread.run()
                 elif recv_data[0] == '@':#this is file_transfer package msg
                     relay_race(recv_data)
+                elif recv_data[0] == "%":#this is ack msg protocol/msg
+                    ack_feedback = int(recv_data[1:])
+                    print "ACK : " +str(ack_feedback)+" received"
+                    DATA_WAITING_FOR_ACK_LOCK.acquire()
+                    del DATA_WAITING_FOR_ACK[ack_feedback]
+                    DATA_WAITING_FOR_ACK_LOCK.release()                   
 
 
 
@@ -665,6 +824,12 @@ if __name__ == '__main__':
 
         main(sys.argv)
 
-
-
-
+#  Test case passed on a 5 nodes topology having loops within loops (see readme)
+# CLOSE
+# CHANGECOST 192.168.0.19 4118 1
+# CHANGECOST 192.168.0.19 4118 30
+# LINKDOWN 192.168.0.19 4118
+# LINKUP 192.168.0.19 4118
+# TRANSFER test.jpg 192.168.0.19 4117
+# ADDPROXY 192.168.0.2 41192 192.168.0.19 4119
+# REMOVEPROXY 192.168.0.19 4119
